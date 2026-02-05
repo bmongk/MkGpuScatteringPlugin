@@ -1,0 +1,27 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+// Adapted from the VirtualHeightfieldMesh plugin
+
+#include "/Engine/Private/Common.ush"
+
+
+
+RWBuffer<float4> RWNormalAndHeight;
+
+
+float2 UVCoords;
+Texture2D HeightmapTexture;
+SamplerState HeightmapTextureSampler;
+
+Texture2D NormalmapTexture;
+SamplerState NormalmapTextureSampler;
+
+[numthreads(1, 1, 1)]
+void ReadHeightmap_CS(uint3 DispatchThreadId : SV_DispatchThreadID, uint GroupIndex : SV_GroupIndex)
+{
+	float4 SampleValue = Texture2DSample(NormalmapTexture, NormalmapTextureSampler, UVCoords);
+	float2 SampleNormal = float2(SampleValue.b, SampleValue.a) * float2(2.0, 2.0) - float2(1.0, 1.0);
+	float3 LocalNormal = float3(SampleNormal, sqrt(max(1.0 - dot(SampleNormal, SampleNormal), 0.0)));
+
+	float Height = DecodePackedHeight(SampleValue.xy);
+	RWNormalAndHeight[DispatchThreadId.x] = float4(LocalNormal, Height);
+}

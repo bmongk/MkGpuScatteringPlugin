@@ -1,0 +1,380 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+// Adapted from the VirtualHeightfieldMesh plugin
+
+#include "/Engine/Private/Common.ush"
+
+#include "MkGPUScatteringLibrary.ush"
+
+//#ifndef USE_HALTON
+//#define USE_HALTON 1
+//#endif
+
+#ifndef USE_WEIGHTMAP
+#define USE_WEIGHTMAP 1
+#endif
+
+
+/** Structure used for tracking work queues in persistent wave style shaders. */
+struct FProgressInfo
+{
+	uint Count;
+	uint MaxInstances;
+	//bool bComplete;
+
+
+};
+
+// Todo
+// FLocationOnly, FLocationAndNormal define으로 구분 되도록 개선
+struct FLocationOnly
+{
+	float3 Location;
+};
+
+struct FLocationAndNormal
+{
+	float3 Location;
+	float3 ComputedNormal;
+};
+
+struct FLocationNormalScaleZ
+{
+	float3 Location;
+	float3 ComputedNormal;
+	float ScaleZ;
+};
+
+//~ parameter를 늘리다가 정상 동작하지 않는 문제를 경험하고 더 이상 추가하지 않는 중임.
+struct FScatteringInput
+{
+	float2 Origin;
+	float2 Extent;
+	float2 Offset;
+	float2 SectionBase;
+
+	float3 DrawScale;
+
+	uint SqrtMaxInstances;
+	//~ halton
+	uint HaltonBaseIndex;
+	//~ end of halton
+
+	uint Stride;
+};
+//~!
+
+struct FResultInfo
+{
+	float4 LocationAndAlignZ;
+};
+
+
+
+
+
+///////////////////
+
+#if USE_WEIGHTMAP
+uint WeightmapChannelIdx;
+#endif
+
+uint UseGrid;
+uint AlignToSurface;
+
+float HeightFalloffRange;
+float PlacementJitter;
+int InstancingRandomSeed;
+
+//~ Voronoi noise
+// GroupSize/ Scale, ValidRange
+uint bUseVoronoiNoise;
+float4 VoronoiSetting;
+//~ end of voronoi noise
+
+float2 SlopeMinMax;
+float2 HeightMinMax;
+
+
+StructuredBuffer<FScatteringInput> Input;
+
+RWStructuredBuffer<FProgressInfo> RWProgressInfo;
+RWStructuredBuffer<FLocationNormalScaleZ> RWResultBuffer;
+
+Texture2D HeightmapTexture;
+SamplerState HeightmapTextureSampler;
+
+#if USE_WEIGHTMAP
+Texture2D WeightmapTexture;
+SamplerState WeightmapTextureSampler;
+#endif
+
+void MarkForExcept(uint InstanceIndex, uint DebugValue)
+{
+	// MkGpuScatteringReadbackManager에서 Array가 정리 되도록 값 세팅
+	RWResultBuffer[InstanceIndex].ComputedNormal = float3(0, 0, max(2, DebugValue));
+}
+
+[numthreads(32, 32, 1)]
+void Scattering_CS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	FScatteringInput Param = Input[0];
+	uint InstanceIndex = (DispatchThreadId.y * Param.SqrtMaxInstances + DispatchThreadId.x);
+
+	//[Branch]
+	//if (DispatchThreadId.x > Param.SqrtMaxInstances - 1 || DispatchThreadId.y > Param.SqrtMaxInstances - 1)
+	[Branch]
+	if (InstanceIndex >= Param.SqrtMaxInstances * Param.SqrtMaxInstances)
+	{
+		MarkForExcept(InstanceIndex, 999);
+		return;
+	}
+
+	InterlockedAdd(RWProgressInfo[0].Count, 1);
+
+	FNumberGenerator NumberGenerator;
+	NumberGenerator.SetSeed(InstancingRandomSeed + InstanceIndex);
+
+	//[Branch]
+	//if (RWProgressInfo[0].Count > Param.SqrtMaxInstances * Param.SqrtMaxInstances)
+	//{
+	//	MarkForExcept(InstanceIndex, 999);
+	//	return;
+	//}
+	float2 Extent = Param.Extent;
+
+	float3 Location = float3(0, 0, 0);
+
+	float HaltonX = Halton(InstanceIndex + Param.HaltonBaseIndex, 2.0);
+	float HaltonY = Halton(InstanceIndex + Param.HaltonBaseIndex, 3.0);
+
+	float2 Origin = Param.Origin;
+
+	[Branch]
+	if (UseGrid)
+	{
+		float Div = 1.0f / float(Param.SqrtMaxInstances);
+		Origin += Extent * (Div * 0.5f);
+
+		//Location = float3(Origin.x + HaltonX * Extent.x, Origin.y + HaltonY * Extent.y, 0.0f);
+		float GridX = InstanceIndex / Param.SqrtMaxInstances;
+		float GridY = InstanceIndex % Param.SqrtMaxInstances;
+		Location = float3(Origin.x + GridX * Div * Extent.x, Origin.y + GridY * Div * Extent.y, 0.0);
+
+		float MaxJitter1D = clamp(PlacementJitter, 0.0f, 0.99f) * Div * 0.5f;
+		float2 MaxJitter = float2(MaxJitter1D, MaxJitter1D);
+		MaxJitter.xy *= Extent.xy;
+
+		float randX = NumberGenerator.GetRandomFloat(0, PlacementJitter);
+		float randY = randX;
+		Location.xy += float2(randX * 2.0f - 1.0f, randY * 2.0f - 1.0f) * MaxJitter.xy;
+	}
+	else
+	{
+		Location = float3(Param.Origin.x + HaltonX * Extent.x, Param.Origin.y + HaltonY * Extent.y, 0.0f);
+	}
+
+	float2 Offset = Param.Offset;
+	float3 DrawScale = Param.DrawScale;
+
+	// Get height
+	float2 SectionBase = Param.SectionBase;
+
+	// Find location
+	float TestX = (Location.x / DrawScale.x) - SectionBase.x;
+	float TestY = (Location.y / DrawScale.y) - SectionBase.y;
+
+	// Find data
+	float X1 = floor(TestX);
+	float Y1 = floor(TestY);
+	float X2 = ceil(TestX);
+	float Y2 = ceil(TestY);
+
+	uint Stride = Param.Stride;
+	float Quads = (float) (Stride - 1);
+
+	float ClampMin = 0;
+	float ClampMax = Quads;
+
+	// Clamp to prevent the sampling of the final columns from overflowing
+	float IdxX1 = clamp(X1, ClampMin, ClampMax);
+	float IdxY1 = clamp(Y1, ClampMin, ClampMax);
+	float IdxX2 = clamp(X2, ClampMin, ClampMax);
+	float IdxY2 = clamp(Y2, ClampMin, ClampMax);
+
+	float LerpX = TestX - X1;
+	float LerpY = TestY - Y1;
+
+
+	float2 uv11 = float2(IdxX1 / Quads, IdxY1 / Quads);
+	float2 uv21 = float2(IdxX2 / Quads, IdxY1 / Quads);
+	float2 uv12 = float2(IdxX1 / Quads, IdxY2 / Quads);
+	float2 uv22 = float2(IdxX2 / Quads, IdxY2 / Quads);
+
+	float LayerWeight = 1.0f;
+#if USE_WEIGHTMAP
+	// Bilinear interpolate sampled weights
+	[Branch]
+	if (WeightmapChannelIdx > 0)
+	{
+		float IndexX = clamp(TestX, ClampMin, ClampMax);
+		float IndexY = clamp(TestY, ClampMin, ClampMax);
+		float2 uv = float2(IndexX / Quads, IndexY / Quads);
+		float4 SampleWeight = Texture2DSampleLevel(WeightmapTexture, WeightmapTextureSampler, uv, 0);
+
+		uint channel = WeightmapChannelIdx - 1;
+		LayerWeight = SampleWeight[channel];
+
+		float sum_weights = SampleWeight.x + SampleWeight.y + SampleWeight.z + SampleWeight.w;
+		float other_weights = (sum_weights - LayerWeight) / 3.0;
+
+		if (sum_weights < other_weights)
+		{
+			RWResultBuffer[InstanceIndex].Location = float3(LayerWeight, 0, 0);
+			MarkForExcept(InstanceIndex, 200);
+			return;
+		}
+
+		float RandWeight = NumberGenerator.GetRandomFloat(LayerWeight * 0.5, 1.0);
+		if (LayerWeight < RandWeight)
+		{
+			RWResultBuffer[InstanceIndex].Location = float3(LayerWeight, 0, 0);
+			MarkForExcept(InstanceIndex, 201);
+			return;
+		}
+
+	}
+#endif
+
+	// Bilinear interpolate sampled heights
+	float4 SamplePixel11 = Texture2DSampleLevel(HeightmapTexture, HeightmapTextureSampler, uv11, 0);
+	float SampleHeight11 = DecodePackedHeight(SamplePixel11.xy);
+
+	float4 SamplePixel21 = Texture2DSampleLevel(HeightmapTexture, HeightmapTextureSampler, uv21, 0);
+	float SampleHeight21 = DecodePackedHeight(SamplePixel21.xy);
+
+	float4 SamplePixel12 = Texture2DSampleLevel(HeightmapTexture, HeightmapTextureSampler, uv12, 0);
+	float SampleHeight12 = DecodePackedHeight(SamplePixel12.xy);
+
+	float4 SamplePixel22 = Texture2DSampleLevel(HeightmapTexture, HeightmapTextureSampler, uv22, 0);
+	float SampleHeight22 = DecodePackedHeight(SamplePixel22.xy);
+
+	float Interp1 = lerp(SampleHeight11, SampleHeight21, LerpX);
+	float Interp2 = lerp(SampleHeight12, SampleHeight22, LerpX);
+
+	float FinalZ = lerp(Interp1, Interp2, LerpY) * DrawScale.z;
+
+	[Branch]
+	if (FinalZ < HeightMinMax.x || FinalZ > HeightMinMax.y)
+	{
+		RWResultBuffer[InstanceIndex].Location = float3(0, 0, FinalZ);
+		MarkForExcept(InstanceIndex, 100);
+		return;
+	}
+
+	// HeightMinMax.x : Min,  y : Max
+	float2 DiffHeight = abs(HeightMinMax - FinalZ);
+	float2 HeightFalloffMinMax = saturate(DiffHeight / HeightFalloffRange);
+	float HeightFalloff = min(HeightFalloffMinMax.x, HeightFalloffMinMax.y);
+
+	float RandHeightFalloff = NumberGenerator.GetRandomFloat(HeightFalloff * 0.5, 1.0);
+	if (HeightFalloff < RandHeightFalloff)
+	{
+		RWResultBuffer[InstanceIndex].Location = float3(0, 0, FinalZ);
+		MarkForExcept(InstanceIndex, 300);
+		return;
+	}
+
+	float ScaleZ = 1.0;
+
+	[Branch]
+	if (bUseVoronoiNoise)
+	{
+		float NoiseImageSize = 512;
+		float3 VoronoiRes = voronoiNoise((Location.xy) / VoronoiSetting[0], VoronoiSetting[1], float2(NoiseImageSize, NoiseImageSize), 0.0);
+
+		float lerp_z = 1.0 - ((VoronoiRes.x + VoronoiRes.y + VoronoiRes.z) / 3.0);
+
+		float randRes = NumberGenerator.GetRandomFloat(0.05, 1.0);
+
+		[Branch]
+		if (lerp_z < VoronoiSetting[2] || lerp_z > VoronoiSetting[3])
+		{
+			if (lerp_z < randRes)
+			{
+				MarkForExcept(InstanceIndex, 100);
+				return;
+			}
+		}
+
+		ScaleZ = lerp_z;
+	}
+
+	ScaleZ *= LayerWeight * HeightFalloff;
+
+	Location.xy -= DrawScale.xy * Offset.xy;
+	Location.z = FinalZ;
+
+
+	// Compute normal
+	float3 ComputedNormal = float3(0, 0, 0);
+	{
+		float3 P11 = float3(X1, Y1, SampleHeight11);
+		float3 P22 = float3(X2, Y2, SampleHeight22);
+
+		// Choose triangle and compute normal
+		[Branch]
+		if (LerpX > LerpY)
+		{
+			float3 P21 = float3(X2, Y1, SampleHeight21);
+
+
+			if ((P11.x != P21.x || P11.y != P21.y || P11.z != P21.z)
+				&& (P22.x != P21.x || P22.y != P21.y || P22.z != P21.z))
+			{
+				ComputedNormal = normalize(cross((P22 - P21), (P11 - P21)));
+			}
+			else
+			{
+				ComputedNormal = float3(0, 0, 0);
+			}
+		}
+		else
+		{
+			float3 P12 = float3(X1, Y2, SampleHeight12);
+
+			if ((P11.x != P12.x || P11.y != P12.y || P11.z != P12.z)
+				&& (P22.x != P12.x || P22.y != P12.y || P22.z != P12.z))
+			{
+				ComputedNormal = normalize(cross((P11 - P12), (P22 - P12)));
+			}
+			else
+			{
+				ComputedNormal = float3(0, 0, 0);
+			}
+		}
+	}
+	//
+
+	//Location = float3(1.0f / 2.0f, 1.0f / 3.0f, 123);
+	//Location = float3(HaltonX, HaltonY, (float) Param.HaltonBaseIndex);
+
+	RWResultBuffer[InstanceIndex].ScaleZ = ScaleZ;
+	RWResultBuffer[InstanceIndex].Location = Location;
+
+	[Branch]
+	if (IsWithinSlopeAngle(ComputedNormal.z, SlopeMinMax.x, SlopeMinMax.y))
+	{
+		RWResultBuffer[InstanceIndex].ComputedNormal = ComputedNormal;
+		return;
+	}
+
+	MarkForExcept(InstanceIndex, 101);
+}
+
+
+// Tree
+[numthreads(8, 8, 1)]
+void ScatteringTree_CS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+
+}
